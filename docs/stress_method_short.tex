@@ -1,0 +1,545 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage[margin=25mm]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{microtype}
+
+\newcommand{\vect}[1]{\mathbf{#1}}
+\newcommand{\mat}[1]{\mathbf{#1}}
+\newcommand{\vm}{\sigma_{\mathrm{vM}}}
+\newcommand{\allow}{\sigma_{\mathrm{allow}}}
+\newcommand{\yield}{\sigma_{\mathrm{y}}}
+
+\title{A plane-stress finite element method for\\
+       stress-driven Voronoi pocket patterns}
+\author{Voronoi Pocket add-in for Autodesk Fusion, version 0.5.0}
+\date{November 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\noindent
+This note documents the mathematics behind the stress-driven mode of the
+Voronoi Pocket add-in. A flat face of a part is treated as a thin plate
+loaded in its own plane. The plate is meshed with constant-strain triangles
+on a boundary-fitted equilateral lattice, the linear elastic equations are
+solved with a Jacobi-preconditioned conjugate gradient method, and the
+von~Mises stress is recovered at the mesh nodes. The stress field then sets
+two properties of a Voronoi pocket pattern: the wall thickness of every
+cell, from a rule that keeps material in proportion to load, and the cell
+size, through a density-weighted centroidal Voronoi relaxation. All formulas
+are given as implemented in \texttt{core/stress.py} and
+\texttt{core/geometry.py}. The method is validated against closed-form
+solutions; its accuracy and its limits are stated with measured numbers.
+\end{abstract}
+
+\section{Scope and assumptions}
+
+The calculation is a design aid for deciding where a pocket pattern should
+leave more material. It is not a strength verification. The assumptions are:
+
+\begin{enumerate}
+  \item \textbf{Plane stress.} The plate is thin, and all forces act in its
+        plane, so $\sigma_{zz}=\sigma_{xz}=\sigma_{yz}=0$.
+  \item \textbf{Linear elasticity, small displacements,} isotropic material
+        with Young's modulus $E$ and Poisson's ratio $\nu$.
+  \item \textbf{Solid plate.} The stress is that of the face before any
+        pocket is cut. The pockets change the stress field; this is not fed
+        back.
+  \item \textbf{Static loading.} No dynamics, fatigue or buckling.
+\end{enumerate}
+
+\paragraph{Units.} The implementation uses centimetres and newtons, so
+stresses are in $\mathrm{N/cm^2}$, with
+$1~\mathrm{MPa} = 100~\mathrm{N/cm^2}$.
+
+\section{Governing equations}
+
+Let $\Omega\subset\mathbb{R}^2$ be the face (an outer outline minus holes),
+$t$ the plate thickness and $\vect{u}=(u,v)^{\mathsf T}$ the in-plane
+displacement. In Voigt notation the strain and stress are
+\begin{equation}
+  \boldsymbol{\varepsilon} =
+  \begin{pmatrix} \varepsilon_{xx}\\ \varepsilon_{yy}\\ \gamma_{xy} \end{pmatrix}
+  =
+  \begin{pmatrix}
+    \partial u/\partial x\\
+    \partial v/\partial y\\
+    \partial u/\partial y + \partial v/\partial x
+  \end{pmatrix},
+  \qquad
+  \boldsymbol{\sigma} =
+  \begin{pmatrix} \sigma_{xx}\\ \sigma_{yy}\\ \sigma_{xy} \end{pmatrix}
+  = \mat{D}\,\boldsymbol{\varepsilon},
+\end{equation}
+with the plane-stress elasticity matrix
+\begin{equation}
+  \mat{D} = \frac{E}{1-\nu^2}
+  \begin{pmatrix}
+    1 & \nu & 0\\
+    \nu & 1 & 0\\
+    0 & 0 & \dfrac{1-\nu}{2}
+  \end{pmatrix}
+  =
+  \begin{pmatrix}
+    d_{11} & d_{12} & 0\\
+    d_{12} & d_{11} & 0\\
+    0 & 0 & d_{33}
+  \end{pmatrix}.
+  \label{eq:D}
+\end{equation}
+Equilibrium without body forces is $\nabla\cdot\boldsymbol{\sigma}=\vect{0}$
+in $\Omega$. The boundary $\partial\Omega$ is split into a held part
+$\Gamma_u$ with $\vect{u}=\vect{0}$, a loaded part $\Gamma_t$ with a given
+traction, and a free remainder. The weak form reads: find $\vect{u}$ with
+$\vect{u}=\vect{0}$ on $\Gamma_u$ such that for all admissible $\vect{w}$
+\begin{equation}
+  t\int_\Omega \boldsymbol{\varepsilon}(\vect{w})^{\mathsf T}\,\mat{D}\,
+               \boldsymbol{\varepsilon}(\vect{u})\,\mathrm{d}A
+  \;=\; \int_{\Gamma_t} \vect{w}^{\mathsf T}\,\vect{q}\,\mathrm{d}s
+  \;+\; \sum_k \vect{w}(\vect{x}_k)^{\mathsf T}\,\vect{F}_k ,
+  \label{eq:weak}
+\end{equation}
+where $\vect{q}$ is a line load (force per length) on loaded edges and
+$\vect{F}_k$ are forces at points $\vect{x}_k$.
+
+\paragraph{Independence of the stiffness.} With prescribed forces and
+homogeneous displacement conditions, scaling $E$ scales the displacements by
+$1/E$ and leaves the stresses unchanged. The implementation therefore
+solves with a fixed $E$ and takes only $\nu$ from the material. The stress
+does depend on $\nu$ wherever the plate is statically indeterminate (near
+supports and around holes).
+
+\section{Mesh}
+
+Let $h$ be the target triangle size; the default is the diagonal of the
+face's bounding box divided by 65.
+
+\paragraph{Lattice.} Points of an equilateral lattice are laid over the
+bounding box:
+\begin{equation}
+  \vect{p}_{ij} = \Bigl( x_0 + i\,h + \tfrac{h}{2}\,(j \bmod 2),\;
+                        y_0 + j\,\tfrac{\sqrt{3}}{2}\,h \Bigr).
+\end{equation}
+Each lattice cell between rows $j$ and $j+1$ gives two triangles.
+
+\paragraph{Boundary fitting.} A lattice point whose distance to the boundary
+is below a reach $r_s = 0.51\,h$ is moved to its nearest boundary point; a
+point further away is kept if it lies inside $\Omega$ and discarded
+otherwise. The choice $r_s > h/2$ guarantees that of any two neighbouring
+lattice points on opposite sides of the boundary at least one is moved, so
+the rim of the mesh consists of moved points only and follows the outline.
+Moved points closer together than $0.3\,h$ are merged into one. Without
+this, the sliver between them would have to be dropped, which leaves a slit
+that acts as a crack. Finally, for every outline vertex whose turning angle
+exceeds $25^\circ$, the nearest boundary node within $0.75\,h$ is placed
+exactly on that vertex, so sharp corners survive.
+
+\paragraph{Filtering.} A triangle is kept if its three nodes are distinct,
+its signed doubled area is at least $2\%$ of that of a full lattice triangle
+($\tfrac{\sqrt 3}{2}h^2$), and its centroid lies inside $\Omega$. Of the
+remaining triangles only the largest edge-connected group is used, because a
+fragment attached by a single node could rotate freely and would make the
+stiffness matrix singular.
+
+On the test shapes this mesh reproduces the area of the face to within
+$0.2\%$, all rim edges lie on the true boundary, and the worst element
+quality $q = 4\sqrt{3}\,A/(a^2+b^2+c^2)$ is $0.59$.
+
+\section{Finite element discretisation}
+
+\subsection{Constant-strain triangle}
+
+Each triangle has nodes $1,2,3$ at $(x_i,y_i)$, ordered counter-clockwise,
+with linear shape functions~\cite{zienkiewicz}. Define, with cyclic indices,
+\begin{equation}
+  b_i = y_j - y_k, \qquad c_i = x_k - x_j, \qquad
+  2A = x_1 b_1 + x_2 b_2 + x_3 b_3 .
+\end{equation}
+The strain is constant in the element,
+$\boldsymbol{\varepsilon} = \mat{B}\,\vect{u}_e$ with
+$\vect{u}_e = (u_1,v_1,u_2,v_2,u_3,v_3)^{\mathsf T}$ and
+\begin{equation}
+  \mat{B} = \frac{1}{2A}
+  \begin{pmatrix}
+    b_1 & 0 & b_2 & 0 & b_3 & 0\\
+    0 & c_1 & 0 & c_2 & 0 & c_3\\
+    c_1 & b_1 & c_2 & b_2 & c_3 & b_3
+  \end{pmatrix}.
+  \label{eq:B}
+\end{equation}
+The element stiffness matrix is
+$\mat{K}_e = t\,A\,\mat{B}^{\mathsf T}\mat{D}\,\mat{B}$. Written as $2\times2$
+blocks coupling node $p$ with node $q$:
+\begin{equation}
+  \mat{K}_e^{pq} = \frac{t}{4A}
+  \begin{pmatrix}
+    d_{11}\,b_p b_q + d_{33}\,c_p c_q & d_{12}\,b_p c_q + d_{33}\,c_p b_q\\[2pt]
+    d_{12}\,c_p b_q + d_{33}\,b_p c_q & d_{11}\,c_p c_q + d_{33}\,b_p b_q
+  \end{pmatrix}.
+  \label{eq:Ke}
+\end{equation}
+The global matrix $\mat{K}$ is assembled by summing these blocks and stored
+row by row as sparse lists.
+
+\subsection{Supports}
+
+Every boundary node lying on a held edge has both displacement components
+set to zero (optionally only one, for sliding supports). These degrees of
+freedom are removed from the system. At least three held degrees of freedom
+are required to exclude the three rigid-body motions of the plane.
+
+\subsection{Loads}
+
+\paragraph{Force on an edge.} A total force $\vect{F}$ on an edge is taken
+as a uniform line load. Let the edge's boundary nodes, ordered along the
+edge, sit at arc lengths $s_1<\dots<s_m$. Node $k$ receives the share of the
+edge it covers,
+\begin{equation}
+  \vect{f}_k = \vect{F}\,\frac{\ell_k}{\sum_j \ell_j},
+  \qquad
+  \ell_k = \tfrac12\,(s_k - s_{k-1}) + \tfrac12\,(s_{k+1} - s_k),
+\end{equation}
+with the missing term dropped at the two ends. This is the consistent nodal
+load of a uniform traction for linear elements. For a closed ring (a hole
+rim) the gap between the last and the first node is split between them. If
+several edges are loaded, the force is divided between them in proportion to
+their lengths.
+
+\paragraph{Force at a point.} A force on a single node produces a stress
+peak that depends only on the mesh. A point force $\vect{F}$ at $\vect{x}_0$
+is therefore spread over the nodes within a radius $r_p = 1.5\,h$, with
+cone-shaped weights
+\begin{equation}
+  \vect{f}_k = \vect{F}\,\frac{w_k}{\sum_j w_j},
+  \qquad
+  w_k = 1 - \frac{\lVert \vect{x}_k - \vect{x}_0\rVert}{r_p}
+  \quad\text{for } \lVert \vect{x}_k - \vect{x}_0\rVert < r_p .
+\end{equation}
+The resultant is exactly $\vect{F}$. This models a force that arrives
+through a small pad or bolt head.
+
+\subsection{Solution}
+
+With held degrees of freedom removed, the system
+$\mat{K}\,\vect{u} = \vect{f}$ is symmetric positive definite. It is solved
+by the conjugate gradient method~\cite{hestenes} with the diagonal of $\mat{K}$ as
+preconditioner, $\mat{M} = \operatorname{diag}(\mat{K})$:
+\begin{align*}
+  &\vect{u}_0 = \vect{0},\quad \vect{r}_0 = \vect{f},\quad
+   \vect{z}_0 = \mat{M}^{-1}\vect{r}_0,\quad \vect{p}_0 = \vect{z}_0,\\
+  &\alpha_k = \frac{\vect{r}_k^{\mathsf T}\vect{z}_k}
+                   {\vect{p}_k^{\mathsf T}\mat{K}\,\vect{p}_k},\qquad
+   \vect{u}_{k+1} = \vect{u}_k + \alpha_k\vect{p}_k,\qquad
+   \vect{r}_{k+1} = \vect{r}_k - \alpha_k\mat{K}\,\vect{p}_k,\\
+  &\vect{z}_{k+1} = \mat{M}^{-1}\vect{r}_{k+1},\qquad
+   \beta_k = \frac{\vect{r}_{k+1}^{\mathsf T}\vect{z}_{k+1}}
+                  {\vect{r}_k^{\mathsf T}\vect{z}_k},\qquad
+   \vect{p}_{k+1} = \vect{z}_{k+1} + \beta_k\vect{p}_k .
+\end{align*}
+Iteration stops when $\lVert\vect{r}_k\rVert_2 \le 10^{-7}\,\lVert\vect{f}\rVert_2$.
+The support reaction is recovered as
+$\vect{R} = \sum_{d\in\text{held}} (\mat{K}\vect{u} - \vect{f})_d$ and
+serves as a check: it must equal minus the applied force.
+
+\section{Stress recovery}
+
+\subsection{Element stress}
+
+In each triangle the strain follows from \eqref{eq:B},
+\begin{equation}
+  \varepsilon_{xx} = \frac{1}{2A}\sum_p b_p u_p,\qquad
+  \varepsilon_{yy} = \frac{1}{2A}\sum_p c_p v_p,\qquad
+  \gamma_{xy} = \frac{1}{2A}\sum_p \bigl(c_p u_p + b_p v_p\bigr),
+\end{equation}
+and the stress from \eqref{eq:D}:
+$\sigma_{xx} = d_{11}\varepsilon_{xx} + d_{12}\varepsilon_{yy}$,
+$\sigma_{yy} = d_{12}\varepsilon_{xx} + d_{11}\varepsilon_{yy}$,
+$\sigma_{xy} = d_{33}\gamma_{xy}$.
+
+\subsection{Nodal stress}
+
+\paragraph{Interior nodes.} The stress at a node is the area-weighted mean
+over the triangles $T$ that share it:
+\begin{equation}
+  \boldsymbol{\sigma}_n = \frac{\sum_{T\ni n} A_T\,\boldsymbol{\sigma}_T}
+                               {\sum_{T\ni n} A_T}.
+\end{equation}
+
+\paragraph{Boundary nodes.} A boundary node has triangles on one side only,
+so a mean reads too low exactly where stress peaks. For these nodes a plane
+is fitted by least squares to the element stresses of a patch $P$ (all
+triangles sharing a node with a triangle of $n$), taken at the element
+centroids, and evaluated at the node (a simple form of patch
+recovery~\cite{zz}). With
+$\Delta\vect{x}_T = \vect{x}_T - \vect{x}_n = (\xi_T,\eta_T)$, each stress
+component $s$ is modelled as $s \approx a + b\,\xi + c\,\eta$, giving the
+normal equations
+\begin{equation}
+  \begin{pmatrix}
+    N & \sum\xi & \sum\eta\\
+    \sum\xi & \sum\xi^2 & \sum\xi\eta\\
+    \sum\eta & \sum\xi\eta & \sum\eta^2
+  \end{pmatrix}
+  \begin{pmatrix} a\\ b\\ c \end{pmatrix}
+  =
+  \begin{pmatrix} \sum s\\ \sum s\,\xi\\ \sum s\,\eta \end{pmatrix},
+\end{equation}
+with sums over $T\in P$ and $N=|P|$. The nodal value is $a$, obtained by
+Cramer's rule. The fit is used when $N\ge5$ and the matrix is not close to
+singular; otherwise the area-weighted mean is kept.
+
+\subsection{Equivalent stress and safety factor}
+
+The von~Mises stress in plane stress is
+\begin{equation}
+  \vm = \sqrt{\sigma_{xx}^2 - \sigma_{xx}\sigma_{yy} + \sigma_{yy}^2
+              + 3\,\sigma_{xy}^2}\, .
+\end{equation}
+Yielding starts where $\vm$ reaches the yield strength $\yield$. The local
+safety factor and the allowed stress for a target safety factor $n_t$ are
+\begin{equation}
+  n(\vect{x}) = \frac{\yield}{\vm(\vect{x})},
+  \qquad
+  \allow = \frac{\yield}{n_t}.
+\end{equation}
+Inside a triangle, $\vm$ is interpolated linearly from its three nodal
+values with barycentric weights. In the preview, the safety factor is mapped
+to a colour position $c = 1 - \tfrac13\log_2 n$, clamped to $[0,1]$, so that
+$n\le1$ is red, $n=2$ yellow, $n=4$ green and $n\ge8$ blue.
+
+\section{From stress to pattern}
+
+The pattern consists of the Voronoi cells of $N_c$ seed points, restricted to
+the usable area $\Omega_m$ (the face shrunk by the border margin). Each cell
+is shrunk by half its wall thickness to give a pocket.
+
+\subsection{Wall thickness}
+
+\paragraph{Rule.} Keep material in proportion to load. Suppose the solid
+plate carries $\sigma$ at some place and a fraction $\kappa$ of the material
+is kept there. If the remaining ribs carried the load as well as solid
+material, their stress would be about $\sigma/\kappa$. Requiring
+$\sigma/\kappa\le\allow$ gives the kept fraction
+\begin{equation}
+  \kappa = \min\!\Bigl(1,\ \frac{\sigma}{\allow}\Bigr).
+  \label{eq:kappa}
+\end{equation}
+
+\paragraph{Wall for a kept fraction.} Take a cell of area $A_c$ and
+characteristic size $s=\sqrt{A_c}$, and walls of thickness $w$, so the cell
+loses a strip of $w/2$ along every side. Its pocket then covers about
+$(1-w/s)^2$ of the cell, and the kept fraction is
+$\kappa = 1-(1-w/s)^2$. Solving for $w$:
+\begin{equation}
+  w = s\,\bigl(1-\sqrt{1-\kappa}\,\bigr).
+  \label{eq:wall}
+\end{equation}
+
+\paragraph{As implemented.} For cell $i$, $\sigma_i$ is the largest
+interpolated $\vm$ over the centroid and the vertices of the cell clipped to
+$\Omega_m$, and
+\begin{equation}
+  w_i =
+  \begin{cases}
+    \max\bigl(w_{\min},\ s_i\,(1-\sqrt{1-\kappa_i})\bigr), & \kappa_i<1,\\[3pt]
+    2\,s_i \quad\text{(no pocket: the cell stays solid)}, & \kappa_i = 1 .
+  \end{cases}
+\end{equation}
+The value $2s_i$ exceeds the diameter of the largest circle inscribed in any
+convex cell of area $s_i^2$, so no pocket remains whatever the cell's shape.
+Because every cell gives up half of its own wall, the rib between cells $i$
+and $j$ has thickness $\tfrac12(w_i+w_j)$.
+
+\subsection{Cell size}
+
+Cell size follows the load relative to the rest of the part. Let
+$\sigma_{5}$ and $\sigma_{95}$ be the 5th and 95th percentiles of the nodal
+$\vm$ values; the percentiles keep a single sharp peak from flattening the
+scale. With a user-chosen size ratio $R\ge1$ between the widest and the
+narrowest cells, define
+\begin{equation}
+  \beta(\vect{x}) = \operatorname{clamp}\!\Bigl(
+      \frac{\vm(\vect{x})-\sigma_{5}}{\sigma_{95}-\sigma_{5}},\,0,\,1\Bigr),
+  \qquad
+  \omega(\vect{x}) = 1-\Bigl(1-\frac1R\Bigr)\beta(\vect{x}),
+  \qquad
+  \rho(\vect{x}) = \frac{1}{\omega(\vect{x})^2}.
+  \label{eq:density}
+\end{equation}
+Here $\omega$ is the wanted cell width as a fraction of the widest, and
+$\rho\in[1,R^2]$ the wanted number of cells per unit area. If
+$\sigma_{95}-\sigma_{5} < 0.1\,\sigma_{95}$ the part is loaded almost evenly
+and uniform cells are used.
+
+\paragraph{Seeding.} Seed points are drawn in $\Omega_m$ by rejection
+sampling: a uniform candidate $\vect{x}$ is accepted with probability
+$\rho(\vect{x})/R^2$.
+
+\paragraph{Relaxation.} The seeds are evened out by Lloyd iterations: each
+seed moves to the weighted centroid of its cell,
+\begin{equation}
+  \vect{x}_i \leftarrow
+  \frac{\int_{V_i\cap\Omega_m} \vect{x}\,\phi(\vect{x})\,\mathrm{d}A}
+       {\int_{V_i\cap\Omega_m} \phi(\vect{x})\,\mathrm{d}A},
+  \qquad \phi = \rho^2 .
+\end{equation}
+The exponent comes from the asymptotic theory of centroidal Voronoi
+tessellations (Gersho's conjecture, see~\cite{du}): in $d$ dimensions the generators of a
+tessellation that is centroidal for a weight $\phi$ are distributed with
+density proportional to $\phi^{\,d/(d+2)}$. For $d=2$ this is $\phi^{1/2}$, so
+weighting by $\rho^2$ keeps the seeds distributed as $\rho$ itself. The
+integrals are evaluated by fanning each clipped cell into triangles from its
+centroid and sampling $\phi$ at each triangle's centroid.
+
+\section{Validation}
+
+All cases use $\nu = 0.33$. They are part of the automated tests
+(\texttt{tests/test\_stress.py}).
+
+\paragraph{Uniform tension.} A strip of height $H$ and thickness $t$ with
+sliding supports, pulled by $F$, on a hand-built mesh. The solution
+$\sigma_{xx}=F/(Ht)$, $\sigma_{yy}=\sigma_{xy}=0$, elongation $FL/(EHt)$ and
+lateral contraction by $\nu$ is reproduced to a relative error below
+$10^{-6}$, as expected: linear displacement fields lie in the element's
+function space.
+
+\paragraph{Pure shear.} A rectangle sheared by a force $F$ on its top edge of
+width $W$: $\sigma_{xy}=F/(Wt)$ within $2\%$ away from the ends.
+
+\paragraph{In-plane bending.} A cantilever of length $L=20$, height
+$H=10$, thickness $t=0.5$ (cm) with an end shear force $F=1000$~N. Beam
+theory gives the bending stress $\sigma = F(L-x)\,y/I$ with $I=tH^3/12$ and
+the neutral-axis shear stress $\tfrac32 F/(Ht)$, hence $\vm=\sqrt3\cdot300 =
+519.6~\mathrm{N/cm^2}$ there. The computed values agree within $6\%$ and
+$5\%$ respectively on a mesh of about $1500$ nodes.
+
+\paragraph{Plate with a hole.} For a wide plate under remote stress
+$\sigma_\infty$ with a circular hole of radius $a$, the Kirsch
+solution~\cite{timoshenko} on
+the line through the hole centre perpendicular to the load is
+\begin{equation}
+  \frac{\sigma_{\theta\theta}}{\sigma_\infty}
+  = 1 + \frac{a^2}{2r^2} + \frac{3a^4}{2r^4},
+\end{equation}
+which is $3$ on the rim, $1.65$ at $r=1.4a$ and $1.22$ at $r=2a$. For a
+finite width $W$ the gross-section factor on the rim is approximately
+$\bigl[2+(1-d/W)^3\bigr]/(1-d/W)$ with $d=2a$ (Heywood, see~\cite{pilkey}), i.e.\ $3.14$ for
+$d/W=0.2$. Table~\ref{tab:hole} compares.
+
+\begin{table}[ht]
+  \centering
+  \begin{tabular}{lrrrr}
+    \toprule
+    Triangle size $h/a$ & Nodes & On the rim & At $r=1.4a$ & At $r=2a$\\
+    \midrule
+    0.50 & 966 & 1.85 & 1.65 & 1.29\\
+    0.35 & 1951 & 2.21 & -- & --\\
+    0.30 & 2606 & 2.38 & 1.58 & 1.25\\
+    0.25 & 3742 & 2.60 & -- & --\\
+    \midrule
+    Theory & & 3.14 & 1.65 & 1.22\\
+    \bottomrule
+  \end{tabular}
+  \caption{Stress in the load direction, divided by the remote stress, for a
+           plate of width $10a$ with a central hole. A dash means the value
+           was not recorded.}
+  \label{tab:hole}
+\end{table}
+
+Away from the rim the error is about $5\%$. On the rim the peak is
+underestimated by $17$ to $41\%$ and converges slowly, which is the known
+behaviour of the constant-strain triangle at a stress concentration. Since
+pockets start a border margin away from any edge, the pattern is steered by
+the well-resolved part of the field.
+
+\paragraph{Cost.} The implementation is plain Python.
+Table~\ref{tab:time} gives the time for one solve.
+
+\begin{table}[ht]
+  \centering
+  \begin{tabular}{rrr}
+    \toprule
+    Nodes & CG iterations & Time (s)\\
+    \midrule
+    812 & 282 & 0.5\\
+    1459 & 385 & 1.4\\
+    2364 & 455 & 2.5\\
+    3634 & 589 & 5.1\\
+    5834 & 764 & 11.7\\
+    \bottomrule
+  \end{tabular}
+  \caption{Solve time against mesh size for a $240\times100$~mm plate. The
+           iteration count grows roughly like the square root of the number
+           of nodes, so the time grows like its power $1.5$.}
+  \label{tab:time}
+\end{table}
+
+\section{Limitations}
+
+\begin{itemize}
+  \item \textbf{No feedback from the pockets.} The safety factor shown is
+        that of the solid plate. Verifying the pocketed plate would need a
+        mesh fine enough for the thinnest walls, far beyond the mesh sizes
+        of Table~\ref{tab:time}.
+  \item \textbf{The wall rule is optimistic.} Equation~\eqref{eq:kappa}
+        assumes that the ribs carry load as well as solid material. Ribs at
+        an angle to the load carry less, and a random two-dimensional cell
+        structure deforms partly by bending of its walls. The target safety
+        factor has to cover this.
+  \item \textbf{Peaks read low} at hole rims and re-entrant corners
+        (Table~\ref{tab:hole}), and the stress under a point force depends on
+        the spreading radius $r_p$.
+  \item \textbf{In-plane only.} Out-of-plane forces, plate bending and the
+        floor left under pockets that do not go through are not modelled.
+  \item \textbf{Uniform mesh.} There is no local refinement near holes and
+        corners.
+\end{itemize}
+
+\section*{Symbols}
+
+\begin{tabular}{ll}
+  $E$, $\nu$ & Young's modulus, Poisson's ratio\\
+  $t$ & plate thickness\\
+  $h$ & triangle size of the mesh\\
+  $\mat{D}$, $\mat{B}$, $\mat{K}$ & elasticity, strain--displacement and stiffness matrices\\
+  $\vm$ & von Mises stress\\
+  $\yield$, $\allow$, $n_t$ & yield strength, allowed stress, target safety factor\\
+  $\kappa$ & fraction of material kept in a cell\\
+  $s$, $w$, $w_{\min}$ & cell size, wall thickness, thinnest wall\\
+  $R$ & ratio of the widest to the narrowest cells\\
+  $\rho$, $\phi$ & cell density, weight of the Lloyd relaxation\\
+\end{tabular}
+
+\begin{thebibliography}{9}
+\bibitem{zienkiewicz}
+  O.~C. Zienkiewicz, R.~L. Taylor, J.~Z. Zhu,
+  \emph{The Finite Element Method: Its Basis and Fundamentals},
+  Butterworth-Heinemann.
+\bibitem{timoshenko}
+  S.~P. Timoshenko, J.~N. Goodier,
+  \emph{Theory of Elasticity}, McGraw-Hill.
+  (Kirsch solution for a plate with a circular hole.)
+\bibitem{pilkey}
+  W.~D. Pilkey, D.~F. Pilkey,
+  \emph{Peterson's Stress Concentration Factors}, Wiley.
+  (Finite-width correction for a hole in a strip.)
+\bibitem{hestenes}
+  M.~R. Hestenes, E.~Stiefel,
+  Methods of conjugate gradients for solving linear systems,
+  \emph{J. Res. Natl. Bur. Stand.} 49 (1952).
+\bibitem{du}
+  Q.~Du, V.~Faber, M.~Gunzburger,
+  Centroidal Voronoi tessellations: applications and algorithms,
+  \emph{SIAM Review} 41 (1999).
+\bibitem{zz}
+  O.~C. Zienkiewicz, J.~Z. Zhu,
+  The superconvergent patch recovery and a posteriori error estimates,
+  \emph{Int. J. Numer. Methods Eng.} 33 (1992).
+\end{thebibliography}
+
+\end{document}

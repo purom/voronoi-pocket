@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+
+# Written by the add-in while it runs: last dialog values, log, last face
+VoronoiPocket/settings.json
+VoronoiPocket/voronoi_pocket.log
+VoronoiPocket/voronoi_last_face.json
+
+# Made by Fusion and the editor, different on every machine
+.vscode/
+.claude/
+
+# Build output (tools/make_package.py makes the zip again)
+dist/
+*.zip
+
+# LaTeX leftovers
+*.aux
+*.log
+*.out
+*.toc
+*.synctex.gz
+
+.DS_Store
