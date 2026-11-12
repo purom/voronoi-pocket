@@ -6,7 +6,7 @@
 	"description": {
 		"": "Draws a Voronoi cell pattern on a flat face and cuts the cells into the body as pockets."
 	},
-	"version": "0.5.0",
+	"version": "0.6.0",
 	"runOnStartup": false,
 	"supportedOS": "windows|mac",
 	"editEnabled": true

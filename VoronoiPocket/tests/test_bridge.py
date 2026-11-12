@@ -819,6 +819,101 @@ def test_build_with_stress_makes_sketch_and_cut():
     bridge.STRESS_MESH_PARTS = 65.0
 
 
+def test_pocketed_plate_is_checked_when_asked():
+    face, component, sketches, extrudes, setup = _stress_plate()
+    # Pockets as deep as the plate is thick: cut right through.
+    params = dict(STRESS, iterations=1, depth=0.5, cut=True)
+    assert bridge.depth_ratio(params) == 1.0
+    assert bridge.depth_ratio(dict(params, depth=0.2)) == 0.4
+    assert bridge.depth_ratio(dict(params, depth=3.0)) == 1.0          # deeper than the plate
+    assert bridge.depth_ratio(dict(params, depth=0.2, cut=False)) == 1.0   # depth not known
+
+    # Not asked to run it: the quick pattern, marked as not checked yet.
+    notes = []
+    plain = bridge.plan(face, params, notes, setup, run_check=False)[1]
+    assert notes[1] == 'pattern computed' and 'checks' not in plain.settings
+    result = bridge.BuildResult()
+    bridge._fill_result(result, plain, params)
+    assert result.check == {'done': False}
+    bridge._fill_result(result, plain, dict(params, iterations=0))
+    assert result.check == {'done': False}                             # (kept from before)
+    fresh = bridge.BuildResult()
+    bridge._fill_result(fresh, plain, dict(params, iterations=0))
+    assert fresh.check is None
+
+    # Asked: checked and corrected, and kept for the next time.
+    notes = []
+    checked = bridge.plan(face, params, notes, setup)[1]
+    assert notes[0] == 'stress reused' and notes[1].startswith('pattern computed and checked')
+    assert checked.settings['checks'] == 2 and checked.pocketed is not None
+    assert checked.share < plain.share            # cut through, the first walls were too thin
+    result = bridge.BuildResult()
+    bridge._fill_result(result, checked, params)
+    assert result.check['done'] and result.check['checks'] == 2
+    assert result.check['plate_peak_mpa'] >= result.check['wall_peak_mpa'] > 0.0
+    notes = []
+    assert bridge.plan(face, params, notes, setup, run_check=False)[1] is checked
+    assert notes == ['stress reused', 'checked pattern reused']
+
+    # Another depth is another check; until it has run, the quick pattern shows.
+    notes = []
+    assert bridge.plan(face, dict(params, depth=0.2), notes, setup, run_check=False)[1] is plain
+    assert notes == ['stress reused', 'pattern reused']
+    shallow = bridge.plan(face, dict(params, depth=0.2), [], setup)[1]
+    assert shallow.share > checked.share          # the floor carries part of the load
+    # A new load throws the check away with the stress.
+    notes = []
+    bridge.plan(face, dict(params, force=500.0), notes, setup, run_check=False)
+    assert notes[0].startswith('stress computed') and notes[1] == 'pattern computed'
+    bridge.clear_cache()
+    bridge.STRESS_MESH_PARTS = 65.0
+
+
+def test_preview_marks_pockets_over_the_limit():
+    face, component, sketches, extrudes, setup = _stress_plate()
+    params = dict(STRESS, iterations=1, depth=0.5, cut=True)
+
+    # The preview leaves the check alone unless told to run it.
+    result = bridge.preview_outlines(face, params, setup, colours='stress')
+    assert result.check == {'done': False}
+    group, = component.customGraphicsGroups.groups
+    assert len(group.lines) == 4
+    solid_colours = list(group.meshes[0][2])
+
+    result = bridge.preview_outlines(face, dict(params, check_in_preview=True), setup,
+                                     colours='stress')
+    assert result.check['done'] and result.check['over_limit'] == 0
+    group, = component.customGraphicsGroups.groups
+    assert len(group.lines) == 4                  # nothing over the limit, nothing in red
+    # The colours now show the plate with its pockets.
+    assert list(group.meshes[0][2]) != solid_colours
+
+    # Say two cells were left over the limit: their pockets are outlined in red.
+    checked = bridge._cache['checked']
+    two = sorted(set(checked.path_cells))[:2]
+    checked.settings.update(cells_over=two, over_limit=2)
+    result = bridge.preview_outlines(face, dict(params, check_in_preview=True), setup)
+    assert result.check['over_limit'] == 2
+    group, = component.customGraphicsGroups.groups
+    held, loaded, arrow, outlines, marked = group.lines
+    assert group.drawn[-1].color[:3] == (230, 30, 30) and group.drawn[-1].weight == 4
+    red = sum(len(g.path_points(path, arc_steps=6))
+              for path, cell in zip(checked.paths, checked.path_cells) if cell in two)
+    assert len(marked[0]) == 3 * red and len(outlines[0]) > len(marked[0])
+
+    # OK runs the check whatever the preview did.
+    bridge.clear_preview()
+    bridge.clear_cache()
+    built = bridge.build(_design(), face, params, make_pocket=True, final=True, setup=setup)
+    assert built.check['done'] and built.check['checks'] == 2
+    # ...and the real-cut preview only when told to.
+    bridge.clear_cache()
+    shown = bridge.build(_design(), face, params, make_pocket=True, final=False, setup=setup)
+    assert shown.check == {'done': False}
+    bridge.clear_cache()
+    bridge.STRESS_MESH_PARTS = 65.0
+
+
 def test_material_is_read_by_name():
     def prop(ident, name, value, units=''):
         return types.SimpleNamespace(id=ident, name=name, value=value, units=units)

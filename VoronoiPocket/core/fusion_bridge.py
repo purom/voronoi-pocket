@@ -37,6 +37,12 @@ class BuildResult(object):
         self.share = 0.0     # part of the face that became pocket, 0..1
         self.settings = {}   # cells, wall, radius used (chosen in simple mode)
         self.stress_peak_mpa = None  # highest stress found, stress mode only
+        # The check of the pocketed plate (stress mode with Iterations > 0):
+        # None if it was not asked for, else a dict with 'done' (False: asked
+        # for but not run yet, the pattern shown is unchecked) and, when done,
+        # 'rounds', 'checks', 'over_limit', 'wall_peak_mpa', 'plate_peak_mpa',
+        # 'seconds'.
+        self.check = None
         self.notes = []      # what happened, for the log file
 
 
@@ -282,18 +288,37 @@ def _stress_field(face, params, setup, notes):
     _cache['field_key'] = key
     _cache['field'] = field
     _cache.pop('pattern_key', None)  # the pattern depends on the stress
+    _cache.pop('check_key', None)
     notes.append('stress computed: %d points, %d steps, %.2f s, peak %.1f MPa'
                  % (len(field.mesh.nodes), field.steps, field.seconds,
                     field.peak / N_PER_CM2_IN_MPA))
     return field
 
 
-def plan(face, params, notes, setup=None):
+def depth_ratio(params):
+    """Pocket depth as a part of the plate thickness, for the check of the
+    pocketed plate. Without a cut being made the depth is not known, and the
+    pockets are taken to go right through, which is the hardest case."""
+    if not params.get('cut', True):
+        return 1.0
+    thickness = float(params.get('thickness') or 0.0)
+    if thickness <= 0.0:
+        return 1.0
+    return min(1.0, abs(float(params.get('depth') or 0.0)) / thickness)
+
+
+def plan(face, params, notes, setup=None, run_check=True):
     """(frame, pattern) for a face in its own component, from the cache when
     nothing it depends on has changed.
 
     ``setup`` holds the picked edges for the stress-driven pattern:
     {'held': [edges], 'loaded': [edges]}.
+
+    With the stress-driven pattern and ``params['iterations']`` above 0 the
+    pattern is checked on the pocketed plate and corrected (stress.py,
+    ``refine_pattern``). That takes several seconds per round, so with
+    ``run_check`` False it is only used if it is already there, and the
+    unchecked pattern is returned otherwise.
     """
     face_key = _face_key(face)
     if face_key is None or _cache.get('face') != face_key:
@@ -308,11 +333,34 @@ def plan(face, params, notes, setup=None):
         _cache.pop('marks', None)
 
     pattern_key = _pattern_key(params)
+    outer, holes = _cache['outline']
+    rounds = int(params.get('iterations') or 0) if field is not None else 0
+    if rounds > 0:
+        ratio = depth_ratio(params)
+        check_key = pattern_key + (rounds, round(ratio, 4))
+        if _cache.get('check_key') == check_key:
+            notes.append('checked pattern reused')
+            return _cache['frame'], _cache['checked']
+        if run_check:
+            allow = params['yield_mpa'] * N_PER_CM2_IN_MPA / params['safety']
+            pattern = stress.build_stress_pattern(
+                outer, holes, field, allow, params['count'],
+                seed=params['seed'], margin=params['margin'], wall_min=params['wall_min'],
+                radius=params['radius'], min_width=params['min_width'],
+                size_ratio=params['size_ratio'], rounds=rounds, depth_ratio=ratio)
+            _cache['check_key'] = check_key
+            _cache['checked'] = pattern
+            done = pattern.settings
+            notes.append('pattern computed and checked: depth ratio %.2f, %d checks in %.1f s, '
+                         'cells over the limit per check %s'
+                         % (ratio, done['checks'], done['loop_seconds'],
+                            [entry[0] for entry in done['history']]))
+            return _cache['frame'], pattern
+
     if _cache.get('pattern_key') == pattern_key:
         notes.append('pattern reused')
         return _cache['frame'], _cache['pattern']
 
-    outer, holes = _cache['outline']
     if field is not None:
         allow = params['yield_mpa'] * N_PER_CM2_IN_MPA / params['safety']
         pattern = stress.build_stress_pattern(
@@ -351,7 +399,7 @@ def _require_pockets(pattern, params):
         'minimum pocket width, or fewer cells.')
 
 
-def _fill_result(result, pattern):
+def _fill_result(result, pattern, params=None):
     result.pocket_count = len(pattern.paths)
     result.dropped = pattern.dropped
     result.share = pattern.share
@@ -359,6 +407,15 @@ def _fill_result(result, pattern):
     field = _cache.get('field') if 'marks' in _cache else None
     if field is not None:
         result.stress_peak_mpa = field.peak / N_PER_CM2_IN_MPA
+        done = pattern.settings
+        if 'checks' in done:
+            result.check = {
+                'done': True, 'rounds': done['rounds'], 'checks': done['checks'],
+                'over_limit': done['over_limit'], 'seconds': done['loop_seconds'],
+                'wall_peak_mpa': done['wall_peak'] / N_PER_CM2_IN_MPA,
+                'plate_peak_mpa': done['plate_peak'] / N_PER_CM2_IN_MPA}
+        elif params and int(params.get('iterations') or 0) > 0:
+            result.check = {'done': False}
 
 
 # --------------------------------------------------------------------------
@@ -576,7 +633,12 @@ def preview_outlines(selected_face, params, setup=None, colours=None):
     With the stress-driven pattern the held and loaded edges and the forces
     are drawn too, and the face can be coloured: ``colours`` is 'stress' (blue
     idle, red at the allowed stress), 'safety' (by safety factor, red at 1 or
-    below, blue at 8 and above) or None.
+    below, blue at 8 and above) or None. Both show the pocketed plate once it
+    has been checked, and the solid plate before that.
+
+    The check of the pocketed plate is slow, so the preview only runs it when
+    ``params['check_in_preview']`` is set. Pockets whose walls are still over
+    the allowed stress after it are outlined in red.
     """
     clock = time.perf_counter()
     face = native_face(selected_face)
@@ -584,7 +646,8 @@ def preview_outlines(selected_face, params, setup=None, colours=None):
         raise PatternError('Please select a flat face.')
     result = BuildResult()
     clear_preview()
-    frame, pattern = plan(face, params, result.notes, setup)
+    frame, pattern = plan(face, params, result.notes, setup,
+                          run_check=bool(params.get('check_in_preview')))
     maths = time.perf_counter() - clock
 
     clock = time.perf_counter()
@@ -614,12 +677,13 @@ def preview_outlines(selected_face, params, setup=None, colours=None):
         minx, miny, maxx, maxy = geometry.bounding_box(_cache['outline'][0])
         try:
             strength = params['yield_mpa'] * N_PER_CM2_IN_MPA
+            shown = pattern.pocketed or _cache['field']
             if colours == 'stress':
                 allow = strength / params['safety']
-                _draw_stress_map(group, place, _cache['field'],
+                _draw_stress_map(group, place, shown,
                                  lambda level: stress_colour(level / allow))
             elif colours == 'safety':
-                _draw_stress_map(group, place, _cache['field'],
+                _draw_stress_map(group, place, shown,
                                  lambda level: safety_colour(strength / level if level > 0
                                                              else float('inf')))
         except Exception as error:
@@ -629,23 +693,32 @@ def preview_outlines(selected_face, params, setup=None, colours=None):
         except Exception as error:
             result.notes.append('stress marks not drawn: %r' % (error,))
 
-    coordinates = []
-    indices = []
-    for path in pattern.paths:
-        first = len(coordinates) // 3
-        points = geometry.path_points(path, arc_steps=6)
-        for x, y in points:
-            coordinates.extend(place(x, y))
-        count = len(points)
-        for k in range(count):
-            indices.append(first + k)
-            indices.append(first + (k + 1) % count)
-    if indices:
-        _add_lines(group, coordinates, indices)
+    # Pockets of cells that are still over the allowed stress: in red, on top.
+    over = set(pattern.settings.get('cells_over', ()))
+    total = 0
+    for wanted, colour, weight, layer in ((False, (20, 110, 240), 2, 1.0),
+                                          (True, (230, 30, 30), 4, 4.0)):
+        coordinates = []
+        indices = []
+        for number, path in enumerate(pattern.paths):
+            cell = pattern.path_cells[number] if number < len(pattern.path_cells) else -1
+            if (cell in over) != wanted:
+                continue
+            first = len(coordinates) // 3
+            points = geometry.path_points(path, arc_steps=6)
+            for x, y in points:
+                coordinates.extend(place(x, y, layer))
+            count = len(points)
+            for k in range(count):
+                indices.append(first + k)
+                indices.append(first + (k + 1) % count)
+        if indices:
+            _add_lines(group, coordinates, indices, colour, weight)
+        total += len(coordinates) // 3
 
-    _fill_result(result, pattern)
+    _fill_result(result, pattern, params)
     result.notes.append('%d outline points; maths %.2f s, graphics %.2f s'
-                        % (len(coordinates) // 3, maths, time.perf_counter() - clock))
+                        % (total, maths, time.perf_counter() - clock))
     # Raised only now, so the stress picture stays up to show why.
     _require_pockets(pattern, params)
     return result
@@ -921,7 +994,10 @@ def build(design, selected_face, params, make_pocket=True, final=True, setup=Non
         raise PatternError('Please select a flat face.')
     component = face.body.parentComponent
     result = BuildResult()
-    frame, pattern = plan(face, params, result.notes, setup)
+    # OK always checks the pocketed plate when that is asked for; the real-cut
+    # preview only does when the dialog says so.
+    frame, pattern = plan(face, params, result.notes, setup,
+                          run_check=final or bool(params.get('check_in_preview')))
     _require_pockets(pattern, params)
     maths = time.perf_counter() - clock
 
@@ -942,7 +1018,7 @@ def build(design, selected_face, params, make_pocket=True, final=True, setup=Non
     drawing = time.perf_counter() - clock
 
     result.sketch = sketch
-    _fill_result(result, pattern)
+    _fill_result(result, pattern, params)
     result.notes.append('%d sketch curves' % sum(len(path) for path in pattern.paths))
 
     cutting = 0.0

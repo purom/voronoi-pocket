@@ -403,6 +403,246 @@ def test_uneven_cells_keep_margin_and_walls():
             assert g.polygon_outline_distance(pockets[i], pockets[j]) >= 0.12 - 1e-6
 
 
+# ------------------------------------------------------------------ closed loop
+
+def even_pull(shares=None, start=None):
+    """A 10 x 4 plate, 0.5 thick, pulled with 800 N: 400 N/cm^2 everywhere."""
+    left, bottom = [(0.0, 0.0), (0.0, 4.0)], [(0.0, 0.0), (10.0, 0.0)]
+    right = [(10.0, 0.0), (10.0, 4.0)]
+    return s.solve_plate(None, [], [(left, (True, False)), (bottom, (False, True))],
+                         [(right, (800.0, 0.0))], YOUNGS, POISSON, thickness=0.5,
+                         mesh=grid_mesh(10.0, 4.0, 10, 4), shares=shares, start=start)
+
+
+def test_softened_plate_exactly():
+    solid = even_pull()
+    count = len(solid.mesh.triangles)
+
+    # Nothing taken away: the same answer as the solid plate.
+    whole = even_pull([1.0] * count)
+    assert max(abs(a - b) for a, b in zip(whole.node_von_mises, solid.node_von_mises)) < 1e-3
+
+    # Half of the material gone everywhere: it stretches twice as far, and
+    # what is left carries twice the stress.
+    half = even_pull([0.5] * count)
+    assert all(abs(level - 800.0) < 1e-2 for level in half.node_von_mises)
+    assert abs(half.moves[10][0] - 2.0 * solid.moves[10][0]) < 1e-6 * abs(solid.moves[10][0])
+    assert abs(half.reaction[0] + 800.0) < 1e-3
+
+    # Starting from the answer, there is nothing left to solve.
+    assert even_pull([0.5] * count, start=half.moves).steps <= 1
+
+    try:
+        even_pull([0.5] * (count - 1))
+    except s.StressError:
+        pass
+    else:
+        raise AssertionError('expected StressError')
+
+
+def test_material_shares_follow_the_pockets():
+    rect = [(0.0, 0.0), (10.0, 0.0), (10.0, 6.0), (0.0, 6.0)]
+    pattern = g.build_pattern(rect, [], 20, seed=3, wall=0.3, margin=0.4, radius=0.1)
+    mesh = s.make_mesh(rect, [], 0.3)
+    areas = [s._double_area(*[mesh.nodes[n] for n in tri]) / 2.0 for tri in mesh.triangles]
+
+    through = s.material_shares(mesh, pattern.paths, 1.0)
+    assert min(through) >= 0.0 and max(through) <= 1.0
+    removed = sum(area * (1.0 - share) for area, share in zip(areas, through))
+    assert abs(removed - pattern.pocket_area) < 0.005 * pattern.pocket_area
+
+    # A blind pocket takes away its depth's part, a deeper cut than the plate
+    # no more than all of it.
+    blind = s.material_shares(mesh, pattern.paths, 0.6)
+    assert all(abs((1.0 - b) - 0.6 * (1.0 - t)) < 1e-9 for b, t in zip(blind, through))
+    assert s.material_shares(mesh, pattern.paths, 3.0) == through
+    assert s.material_shares(mesh, [], 1.0) == [1.0] * len(areas)
+
+    # The border band is untouched; the middle of a pocket is empty.
+    pockets = [g.path_points(path) for path in pattern.paths]
+    inside = on_band = 0
+    for tri, share in zip(mesh.triangles, through):
+        corners = [mesh.nodes[n] for n in tri]
+        if max(g.point_ring_distance(p, rect) for p in corners) < 0.39:
+            assert share == 1.0
+            on_band += 1
+        elif any(all(g.point_in_polygon(p, pocket) for p in corners) for pocket in pockets):
+            assert share < 1e-9
+            inside += 1
+    assert inside > 100 and on_band > 50
+
+
+def window_plate(depth_ratio, size=0.25):
+    """A pulled 10 x 6 plate with one 4 x 4 pocket in the middle."""
+    rect = [(0.0, 0.0), (10.0, 0.0), (10.0, 6.0), (0.0, 6.0)]
+    left, right = [(0.0, 0.0), (0.0, 6.0)], [(10.0, 0.0), (10.0, 6.0)]
+    solid = s.solve_plate(rect, [], [left], [(right, (1200.0, 0.0))], YOUNGS, POISSON,
+                          thickness=0.5, size=size)
+    window = [('line', (3.0, 1.0)), ('line', (7.0, 1.0)), ('line', (7.0, 5.0)), ('line', (3.0, 5.0))]
+    return solid, s.solve_pocketed(solid, [window], depth_ratio)
+
+
+def stretch(result, at=9.999):
+    """How far the right end of a pulled plate has moved, on average."""
+    ends = [move[0] for node, move in zip(result.mesh.nodes, result.moves) if node[0] > at]
+    return sum(ends) / len(ends)
+
+
+def test_one_pocket_cut_through():
+    solid, cut = window_plate(1.0)
+    assert cut.mesh is solid.mesh and cut.shares is not None
+    assert abs(solid.von_mises_at((5.0, 0.5)) - 400.0) < 20.0
+
+    # A third of the width is left beside the pocket, so three times the stress.
+    for y in (0.5, 5.5):
+        assert abs(cut.von_mises_at((5.0, y)) - 1200.0) < 0.15 * 1200.0
+    # The inside of the pocket holds nothing and reads as nothing.
+    assert cut.von_mises_at((5.0, 3.0)) == 0.0
+    assert all(cut.node_von_mises[n] == 0.0 for n in nodes_near(cut, (5.0, 3.0), 1.5))
+    # The force still arrives at the support.
+    assert abs(cut.reaction[0] + 1200.0) < 0.01
+
+    # Against the same plate meshed with a real hole: it gives about as much.
+    rect = [(0.0, 0.0), (10.0, 0.0), (10.0, 6.0), (0.0, 6.0)]
+    hole = [(3.0, 1.0), (7.0, 1.0), (7.0, 5.0), (3.0, 5.0)]
+    real = s.solve_plate(rect, [hole], [[(0.0, 0.0), (0.0, 6.0)]],
+                         [([(10.0, 0.0), (10.0, 6.0)], (1200.0, 0.0))],
+                         YOUNGS, POISSON, thickness=0.5, size=0.25)
+    assert stretch(cut) > 1.5 * stretch(solid)
+    assert abs(stretch(cut) - stretch(real)) < 0.1 * stretch(real)
+    assert abs(cut.von_mises_at((5.0, 0.5)) - real.von_mises_at((5.0, 0.5))) < 0.1 * 1200.0
+
+
+def test_one_blind_pocket_keeps_a_floor_that_carries():
+    solid, cut = window_plate(1.0)
+    _, blind = window_plate(0.5)
+    beside = [result.von_mises_at((5.0, 0.5)) for result in (solid, blind, cut)]
+    assert beside[0] < beside[1] < beside[2]
+    # The floor is material: it is stretched and it is read.
+    assert blind.von_mises_at((5.0, 3.0)) > 0.5 * 400.0
+    # No pocket at all is the solid plate again.
+    _, none = window_plate(0.0)
+    assert max(abs(a - b) for a, b in zip(none.node_von_mises, solid.node_von_mises)) < 0.5
+
+
+def test_thin_wall_correction():
+    # Walls wide next to the triangles are read as they are.
+    assert s.thin_wall_factor(1.7, 1.0) == 1.0 and s.thin_wall_factor(5.0, 1.0) == 1.0
+    # Thinner ones are raised, as measured: by 1.6 at 0.8 triangles.
+    assert abs(s.thin_wall_factor(0.8, 1.0) - 1.6) < 0.05
+    assert s.thin_wall_factor(1.2, 1.0) < s.thin_wall_factor(0.8, 1.0) < s.thin_wall_factor(0.6, 1.0)
+    # Not stretched beyond what was measured.
+    assert s.thin_wall_factor(0.05, 1.0) == s.thin_wall_factor(0.57, 1.0) < 2.1
+    # A floor takes part of it away; no pocket depth, no correction.
+    assert s.thin_wall_factor(0.8, 1.0, 0.0) == 1.0
+    assert 1.0 < s.thin_wall_factor(0.8, 1.0, 0.5) < s.thin_wall_factor(0.8, 1.0, 1.0)
+
+
+def holed_plate():
+    rect = [(0.0, 0.0), (20.0, 0.0), (20.0, 10.0), (0.0, 10.0)]
+    hole = circle(10.0, 5.0, 2.0, 48)
+    field = s.solve_plate(rect, [hole], [[(0.0, 0.0), (0.0, 10.0)]],
+                          [([(20.0, 0.0), (20.0, 10.0)], (6000.0, 0.0))],
+                          YOUNGS, POISSON, thickness=0.5, size=0.5)
+    return rect, hole, field
+
+
+LOOP = dict(count=40, seed=1, margin=0.3, wall_min=0.15, radius=0.1, min_width=0.2)
+
+
+def test_closed_loop_brings_the_walls_under_the_limit():
+    rect, hole, field = holed_plate()
+    allow = 6000.0
+    once = s.build_stress_pattern(rect, [hole], field, allow, **LOOP)
+    assert 'rounds' not in once.settings and once.pocketed is None
+
+    # No rounds asked for: exactly the pattern as it was before the loop existed.
+    assert s.build_stress_pattern(rect, [hole], field, allow, rounds=0, **LOOP).paths == once.paths
+
+    looped = s.build_stress_pattern(rect, [hole], field, allow, rounds=6, depth_ratio=1.0, **LOOP)
+    st = looped.settings
+    history = st['history']
+    print('      cells over the limit, check by check: %s' % [entry[0] for entry in history])
+    # The pattern from the solid plate's stress alone does not hold once cut through...
+    assert history[0][0] > 10 and history[0][1] > 2.0 * allow
+    # ...and the loop brings it under the limit, or very nearly.
+    assert st['over_limit'] <= 1 and st['wall_peak'] < 1.1 * allow
+    assert st['checks'] == len(history) <= 7 and st['rounds'] <= 6
+    assert st['over_limit'] == min(entry[0] for entry in history)
+    # It did so by leaving more material, never by going under the thinnest wall.
+    assert looped.share < once.share
+    assert min(st['walls']) >= 0.15 - 1e-12 and st['wall'] >= 0.15 - 1e-12
+    assert len(st['cell_levels']) == len(st['walls']) == 40
+    assert looped.pocketed is not None and looped.pocketed.mesh is field.mesh
+    assert st['plate_peak'] >= st['wall_peak']
+    # The margin still holds.
+    for path in looped.paths:
+        for pt in g.path_points(path):
+            assert min(g.point_ring_distance(pt, ring) for ring in (rect, hole)) >= 0.3 - 1e-6
+    # The same again gives the same.
+    again = s.build_stress_pattern(rect, [hole], field, allow, rounds=6, depth_ratio=1.0, **LOOP)
+    assert again.paths == looped.paths
+
+
+def test_more_rounds_are_never_worse():
+    rect, hole, field = holed_plate()
+    ranks = []
+    for rounds in (1, 2, 4):
+        st = s.build_stress_pattern(rect, [hole], field, 6000.0, rounds=rounds,
+                                    depth_ratio=1.0, **LOOP).settings
+        ranks.append((st['over_limit'], st['wall_peak'] if st['over_limit'] else 0.0))
+    assert ranks[0] >= ranks[1] >= ranks[2]
+    assert ranks[2] < ranks[0]
+
+
+def test_closed_loop_with_a_floor():
+    rect, hole, field = holed_plate()
+    through = s.build_stress_pattern(rect, [hole], field, 6000.0, rounds=3, depth_ratio=1.0, **LOOP)
+    blind = s.build_stress_pattern(rect, [hole], field, 6000.0, rounds=3, depth_ratio=0.5, **LOOP)
+    # The floor carries load, so less is over the limit to begin with and
+    # more can be pocketed in the end.
+    assert blind.settings['history'][0][0] < through.settings['history'][0][0]
+    assert blind.settings['over_limit'] == 0
+    assert blind.share > through.share
+    # A check with nothing over the limit and nothing left to thin stops early.
+    idle = s.build_stress_pattern(rect, [hole], field, 1e9, rounds=5, depth_ratio=0.5, **LOOP)
+    assert idle.settings['checks'] == 1 and idle.settings['over_limit'] == 0
+    assert idle.paths == s.build_stress_pattern(rect, [hole], field, 1e9, **LOOP).paths
+
+
+def slow_quick_method_against_a_fine_mesh():
+    """The record of how good the quick method is (about a minute).
+
+    A pulled plate with 30 pockets cut through, walls 3 mm: the quick method
+    on the usual mesh against a mesh of the real pocketed shape, four
+    triangles across every wall. Run with:  python tests/test_stress.py --slow
+    """
+    rect = [(0.0, 0.0), (10.0, 0.0), (10.0, 6.0), (0.0, 6.0)]
+    left, right = [(0.0, 0.0), (0.0, 6.0)], [(10.0, 0.0), (10.0, 6.0)]
+    layout = g._Layout(rect, [], 0.3)
+    layout.place(30, 3, 3)
+    pattern = g._fill(layout, 0.3, 0.1, 0.2)
+    outlines = [g.path_points(path, arc_steps=6) for path in pattern.paths]
+    fine = s.solve_plate(rect, outlines, [left], [(right, (1000.0, 0.0))], YOUNGS, POISSON,
+                         thickness=0.5, size=0.075)
+    solid = s.solve_plate(rect, [], [left], [(right, (1000.0, 0.0))], YOUNGS, POISSON,
+                          thickness=0.5, size=math.hypot(10.0, 6.0) / 65.0)
+    quick = s.solve_pocketed(solid, pattern.paths, 1.0)
+
+    ratios = []
+    for quick_points, fine_points in zip(s.cell_points(quick.mesh, layout),
+                                         s.cell_points(fine.mesh, layout)):
+        levels = sorted(fine.node_von_mises[n] for n in fine_points)
+        nearly_highest = levels[int(0.95 * (len(levels) - 1))]
+        ratios.append(max(quick.node_von_mises[n] for n in quick_points) / nearly_highest)
+    ratios.sort()
+    print('      quick / fine per cell: lowest %.2f, middle %.2f, highest %.2f'
+          % (ratios[0], ratios[len(ratios) // 2], ratios[-1]))
+    assert 0.9 < ratios[len(ratios) // 2] < 1.2
+    assert ratios[0] > 0.65 and ratios[-1] < 1.6
+    assert 1.0 < stretch(fine) / stretch(quick) < 1.35   # the quick plate is too stiff
+
+
 def test_bad_inputs_are_explained():
     rect = [(0.0, 0.0), (10.0, 0.0), (10.0, 6.0), (0.0, 6.0)]
     left = [(0.0, 0.0), (0.0, 6.0)]
@@ -426,7 +666,8 @@ def test_bad_inputs_are_explained():
 if __name__ == '__main__':
     failures = 0
     for name, func in sorted(globals().items()):
-        if name.startswith('test_') and callable(func):
+        slow = name.startswith('slow_') and '--slow' in sys.argv
+        if (name.startswith('test_') or slow) and callable(func):
             try:
                 func()
                 print('ok    ' + name)

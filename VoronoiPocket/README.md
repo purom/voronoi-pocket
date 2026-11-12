@@ -77,6 +77,8 @@ big with thin walls where it is idle.
 | Target safety factor | The safety factor the pattern is sized for: the material may carry its yield strength divided by this. |
 | Thinnest wall | The wall used where the plate is hardly loaded. |
 | Size ratio | How many times wider the pockets in idle areas are than in the most loaded areas. 1 gives pockets of about one size. |
+| Iterations | How many times the result is checked with the pockets cut and corrected (0 to 10). 0 switches the check off. See below. |
+| Check in preview | Off: the preview shows the pattern before the check and OK runs the check. On: the preview runs it too, so every change takes several seconds. |
 | Colours | What the face is coloured by in the Outlines preview: Stress, Safety factor, or Off. |
 
 To put a force somewhere in the middle of the face, draw a sketch with a point
@@ -93,18 +95,43 @@ has a red arrow (a bigger force gets a longer one). The face colours mean:
 The status line gives the highest stress, the allowed stress, and the lowest
 safety factor of the solid plate next to your target.
 
+#### The check with pockets (Iterations)
+
+Cutting pockets changes the stress: what the removed material carried moves
+into the walls. With **Iterations** above 0 the add-in works out the stress
+again with the pockets cut, thickens the walls of pockets that are over the
+allowed stress, thins those far under it (never below **Thinnest wall**), and
+repeats, up to the number you set. It stops early once nothing is over the
+limit.
+
+- The pocket depth counts. A floor left under the pockets carries load, so
+  shallow pockets can have thinner walls than pockets cut right through. With
+  **Cut pockets** off the depth is not known and a cut right through is assumed.
+- It runs when you press OK. Each round takes a few seconds, so the preview
+  only runs it with **Check in preview** ticked; otherwise the status line
+  says the pattern shown is not checked yet.
+- After the check the status line shows the lowest safety factor with
+  pockets, and the colours show the plate with its pockets.
+- Pockets still over the limit when the rounds run out are outlined in red,
+  and after OK a message tells you. Then try more iterations, a thicker
+  thinnest wall, shallower pockets or fewer cells.
+
 Cells, corner radius, minimum pocket width, border margin and seed come from
 the Pattern tab.
 
 **This is a design aid, not a strength check.** Keep in mind:
 
-- The stress is worked out for the solid plate. Cutting the pockets changes it.
+- The check with pockets is a quick estimate on the same coarse mesh. Against
+  a fine calculation of a plate cut right through it read the walls within
+  about 30% when they were at least 1.6 mesh triangles wide; thinner walls
+  read low and are corrected by a measured factor. It does not see the sharp
+  peaks in pocket corners (about 1.5 times higher).
 - It is flat: only forces within the face's plane count. Bending out of the
-  plane, and the floor left under pockets that do not go through, are not part
-  of it.
-- Stress and safety factor are those of the solid plate. The pattern is sized
-  to keep the target safety factor after the pockets are cut, but the pocketed
-  plate itself is not calculated.
+  plane is not part of it. A floor left under the pockets is counted as a
+  thinner plate, not as the real 3D shape.
+- With Iterations at 0, stress and safety factor are those of the solid plate
+  only, and a pattern cut right through will be much weaker than they suggest:
+  thin walls between through pockets bend.
 - Peaks right at a hole's rim or a sharp inside corner read low (about 2.4
   times the far stress where theory says about 3).
 - A force at a point is spread over a small patch around it (about 1/40 of the

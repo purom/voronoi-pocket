@@ -37,13 +37,13 @@ _material = {'poisson': 0.3}
 
 # Dialog inputs by kind.
 _LENGTH_INPUTS = ('margin', 'depth', 'wall', 'radius', 'minWidth', 'wallMin')
-_INT_INPUTS = ('seed', 'pocketing', 'cellCount', 'relax')
-_BOOL_INPUTS = ('simple', 'cutPockets', 'stressOn')
+_INT_INPUTS = ('seed', 'pocketing', 'cellCount', 'relax', 'iterations')
+_BOOL_INPUTS = ('simple', 'cutPockets', 'stressOn', 'checkPreview')
 _NUMBER_INPUTS = ('force', 'safety', 'yieldMPa', 'sizeRatio')  # plain numbers, no unit
 # Shown only while the stress-driven pattern is switched on.
 _STRESS_ONLY = ('stressHelp', 'held', 'loaded', 'force', 'angle', 'loadPoints',
                 'thickness', 'material', 'yieldMPa', 'safety', 'wallMin', 'sizeRatio',
-                'colours')
+                'iterations', 'checkPreview', 'colours')
 
 # Choices of the Colours drop-down on the Stress tab, in order.
 _COLOUR_NAMES = ('Stress', 'Safety factor', 'Off')
@@ -296,6 +296,19 @@ def _build_stress_tab(tab, units, saved):
     _add_number(tab, 'sizeRatio', 'Size ratio', saved,
                 'How many times wider the pockets in idle areas are than in '
                 'the most loaded areas. 1 makes all pockets about one size.')
+    _add_int(tab, 'iterations', 'Iterations', 0, config.MAX_ITERATIONS, 1, saved,
+             'How many times the result is checked and corrected. Each round '
+             'works out the stress again with the pockets cut (the pocket '
+             'depth counts: a floor left under the pockets carries load), '
+             'thickens the walls of pockets that are over the allowed stress '
+             'and thins those far under it. It stops early when nothing is '
+             'over the limit. Each round takes a few seconds. 0 switches the '
+             'check off: the pattern then comes from the solid plate alone.')
+    _add_bool(tab, 'checkPreview', 'Check in preview', saved,
+              'Off: the preview shows the pattern before the check, which is '
+              'quick, and the check runs when you press OK. On: the preview '
+              'runs the check too, so you see the final pattern, but every '
+              'change takes several seconds.')
     colours = tab.addDropDownCommandInput(
         'colours', 'Colours', adsk.core.DropDownStyles.TextListDropDownStyle)
     chosen = saved['colours'] if 0 <= saved['colours'] < len(_COLOUR_NAMES) else 0
@@ -305,8 +318,10 @@ def _build_stress_tab(tab, units, saved):
                    'Stress: blue is idle, red is at the allowed stress. '
                    'Safety factor (yield strength divided by stress): red is '
                    '1 or below, yellow about 2, green about 4, blue 8 and '
-                   'above. Both are for the solid plate, before pockets.')
-    _add_text(tab, 'stressStatus', '', 5)
+                   'above. Both show the plate with its pockets once that '
+                   'has been checked (see Iterations), and the solid plate '
+                   'before.')
+    _add_text(tab, 'stressStatus', '', 6)
 
 
 def _selected_face():
@@ -479,6 +494,9 @@ def _params():
         'safety': _inp('safety').value,
         'wall_min': _inp('wallMin').value,
         'size_ratio': _inp('sizeRatio').value,
+        'iterations': _inp('iterations').value,
+        'check_in_preview': _inp('checkPreview').value,
+        'cut': _inp('cutPockets').value,
         'poisson': _material.get('poisson', 0.3),
         'point_forces': _point_forces(),
     }
@@ -607,12 +625,28 @@ def _summary(result, params, seconds, cut, outlines=False):
         peak = result.stress_peak_mpa or 0.0
         lines.append('Stress: highest %.0f MPa, allowed %.0f MPa. Thinnest wall %s.'
                      % (peak, allowed, _length_text(chosen.get('wall', 0.0))))
-        if peak > 0.0:
+        check = result.check
+        if peak > 0.0 and check and check['done'] and check['plate_peak_mpa'] > 0.0:
+            lines.append('Lowest safety factor: solid plate %.1f, with pockets %.1f (target %.1f).'
+                         % (params['yield_mpa'] / peak,
+                            params['yield_mpa'] / check['plate_peak_mpa'], params['safety']))
+        elif peak > 0.0:
             lines.append('Lowest safety factor of the solid plate: %.1f (target %.1f).'
                          % (params['yield_mpa'] / peak, params['safety']))
         solid = sum(1 for load in chosen.get('cell_loads', ()) if load >= 1.0)
         if solid:
             lines.append('%d cells are at or above the allowed stress and stay solid.' % solid)
+        if check and check['done']:
+            if check['over_limit']:
+                lines.append('Checked with pockets (%d rounds, %.0f s): %d pockets are still '
+                             'over the allowed stress (red).'
+                             % (check['rounds'], check['seconds'], check['over_limit']))
+            else:
+                lines.append('Checked with pockets (%d rounds, %.0f s): no pocket is over '
+                             'the allowed stress.' % (check['rounds'], check['seconds']))
+        elif check:
+            lines.append('Not checked with pockets yet. OK does it (up to %d rounds); '
+                         'tick "Check in preview" to see it first.' % params['iterations'])
     elif params.get('simple'):
         lines.append('Chosen: %d cells, wall %s, corner radius %s'
                      % (chosen.get('count', 0), _length_text(chosen.get('wall', 0.0)),
@@ -625,6 +659,27 @@ def _summary(result, params, seconds, cut, outlines=False):
     if outlines:
         lines.append('Outlines only. OK makes the sketch%s.' % (' and the cut' if cut else ''))
     return '\n'.join(lines)
+
+
+def _warn_if_over_limit(result, params):
+    """After OK the dialog is gone, and its status line with it. So if the
+    check of the pocketed plate ended with pockets still over the allowed
+    stress, say so in a message."""
+    check = result.check
+    if not (check and check['done'] and check['over_limit']):
+        return
+    try:
+        _ui.messageBox(
+            'The pockets were made, but %d of them are still over the allowed stress '
+            'after %d rounds of correction.\n\n'
+            'Highest stress in their walls: %.0f MPa. Allowed: %.0f MPa.\n\n'
+            'To fix it, undo and try more Iterations, a thicker "Thinnest wall", '
+            'a shallower pocket, or fewer cells.'
+            % (check['over_limit'], check['rounds'], check['wall_peak_mpa'],
+               params['yield_mpa'] / params['safety']),
+            'Voronoi Pocket')
+    except Exception:
+        pass
 
 
 def _short_error(trace):
@@ -663,6 +718,7 @@ def _attempt(args, final, outlines=False):
         return
     if final:
         _save_face(params)
+        _warn_if_over_limit(result, params)
     # The outline preview may have fallen back to the real cut.
     outlines = outlines and result.sketch is None
     summary = _summary(result, params, time.perf_counter() - started, cut, outlines)

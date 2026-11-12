@@ -1080,6 +1080,9 @@ class Pattern(object):
         self.pocket_area = 0.0  # total area of all pockets
         # The values the pattern was made with: count, wall, radius, min_width.
         self.settings = {}
+        self.cell_pockets = []  # per cell of the layout: pockets it gave
+        self.path_cells = []    # per path: the cell it came from
+        self.pocketed = None    # stress with the pockets cut, if it was checked
 
     @property
     def share(self):
@@ -1186,6 +1189,7 @@ class _Layout(object):
         self.margin = max(margin, 0.0)
         self.rings = []
         self.cells = []
+        self.points = []  # the cells' centres; cell k is all that is nearest to point k
         self.seed_count = 0
         self._areas = {}
         outer = clean_polygon(outer)
@@ -1236,6 +1240,7 @@ class _Layout(object):
                     value = density(pt)
                     return value * value
             points = lloyd_relax(points, usable, relax, bbox, weight)
+            self.points = points
             self.cells = voronoi_cells(points, bbox)
 
 
@@ -1265,6 +1270,7 @@ def _fill(layout, wall, radius, min_width, walls=None):
     wide_area = layout.area(half_min) if half_min > radius else None
 
     grown_holes = [loop for loop, ccw in zip(core_area.loops, core_area.ccw) if not ccw]
+    result.cell_pockets = [0] * len(layout.cells)
     for index, cell in enumerate(layout.cells):
         if not cell:
             result.dropped += 1
@@ -1275,6 +1281,8 @@ def _fill(layout, wall, radius, min_width, walls=None):
             pockets = _pockets_for(part, core_area, wide_area, wall, radius, half_min)
             if pockets:
                 result.paths.extend(pockets)
+                result.path_cells.extend([index] * len(pockets))
+                result.cell_pockets[index] += len(pockets)
             else:
                 result.dropped += 1
     result.pocket_area = sum(path_area(path) for path in result.paths)

@@ -13,6 +13,7 @@ PANEL_ID = 'SolidCreatePanel'
 
 MAX_CELLS = 1000
 # How many load points the Stress tab can take, each with its own force.
+MAX_ITERATIONS = 10
 MAX_LOAD_POINTS = 6
 
 # Default dialog values. Lengths are expressions, so they work in any
@@ -39,6 +40,8 @@ DEFAULTS = {
     'safety': 2.0,
     'wallMin': '1.5 mm',
     'sizeRatio': 2.5,    # idle pockets are this many times wider than loaded ones
+    'iterations': 3,     # rounds of checking the pocketed plate and correcting; 0 = off
+    'checkPreview': False,  # run that check in the preview too (slow), not only on OK
     'colours': 0,        # outline preview coloured by: 0 stress, 1 safety factor, 2 off
     'pointForce': 500.0, # newtons, the starting value for a load point
 }

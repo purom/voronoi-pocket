@@ -294,6 +294,21 @@ def test_pick_a_face_preview_and_ok_in_each_mode():
     lowest = float(status.split('solid plate: ')[1].split(' ')[0])
     assert 30.0 < lowest < 95.0                                          # 250 / about 3 to 8
 
+    # The check of the pocketed plate: announced, run on request, or off.
+    assert 'Not checked with pockets yet. OK does it (up to 3 rounds)' in status
+    assert 'iterations' in shown() and 'checkPreview' in shown()
+    checked = change(handlers, command, 'checkPreview', value=True)
+    assert 'Checked with pockets' in checked and 'no pocket is over' in checked
+    assert 'Lowest safety factor: solid plate' in checked and 'with pockets' in checked
+    assert 'pockets yet' not in checked
+    off = change(handlers, command, 'iterations', value=0)
+    assert 'pockets yet' not in off and 'Checked with' not in off
+    # What was checked stays shown while nothing it depends on changes.
+    entry._inp('iterations').value = 3
+    assert 'Checked with pockets' in change(handlers, command, 'checkPreview', value=False)
+    status = change(handlers, command, 'seed', value=2)
+    assert 'Not checked with pockets yet' in status
+
     # A force at a point: its own force and direction appear, with a handle
     # on the point, and it adds to the edge force.
     assert 'pForce1' not in shown() and 'pAngle1' not in shown()
@@ -345,7 +360,7 @@ def test_pick_a_face_preview_and_ok_in_each_mode():
     assert 'Outlines only' not in entry._inp('status').text
     saved = settings.load(config.DEFAULTS)
     assert saved['stressOn'] is True and saved['yieldMPa'] == 6.0 and saved['wall'] == '6 mm'
-    assert saved['colours'] == 1
+    assert saved['colours'] == 1 and saved['iterations'] == 3 and saved['checkPreview'] is False
     assert os.path.exists(entry._FACE_PATH)
     fire(handlers, 'destroy', command)
 
@@ -358,6 +373,7 @@ def test_pick_a_face_preview_and_ok_in_each_mode():
     log = open(entry._LOG_PATH, encoding='utf-8').read()
     assert 'FAILED' not in log, log
     assert 'stress computed' in log and 'run done' in log and 'dialog closed' in log
+    assert 'pattern computed and checked' in log and 'Checked with pockets' in log
 
 
 def test_real_cut_preview_and_off():
